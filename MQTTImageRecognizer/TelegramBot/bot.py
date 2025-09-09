@@ -1,5 +1,5 @@
 import logging
-from telegram import KeyboardButton, ReplyKeyboardMarkup, Update, Chat
+from telegram import KeyboardButton, ReplyKeyboardMarkup, Update, Chat, InputFile
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, ApplicationBuilder, MessageHandler, filters
 from threading import Thread
 import time
@@ -8,14 +8,18 @@ import json
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
 import asyncio
+from PIL import Image
+import io
+import base64
+
 
 load_dotenv()
 client=mqtt.Client()
 
 js = {}
 loc_chat_id_list = [] #list of chat ids
-application = ApplicationBuilder().token(os.getenv('TOKEN')).build() #application for the bot
-loop=0 #mqtt loop
+loop= None #mqtt loop
+application=None #bot application
 
 
 ### For Logging
@@ -27,31 +31,102 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
-### Callback for messages on the topics
+
+
+""" on_connect
+
+    This function represents the callback method called when the connection to the broker is enstablished.
+    This allows to perform the subscription to the Topics calling "subscribingMQTT" function.
+"""
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        logging.info("MQTT client connected successfully.")
+        subscribingMQTT()
+    else:
+        logging.error(f"MQTT connection failed with code {rc}")
+
+
+""" on_message
+
+    This function represents the callback method called when a message is received by the client from any Topic.
+    In this case, the elaboration dedicated to the message is strictly correlated to the Topic.
+"""
 def on_message(client, userdata, msg):
     global loc_chat_id_list, application, loop
+
 
     if msg.topic == "photo/ack":
         logging.info("Message arrived on photos/ack")
         for id in loc_chat_id_list:
-            asyncio.run_coroutine_threadsafe(application.bot.send_message(id, "🔀  Message consumed correctly by ESP32-CAM"), loop)
+            asyncio.run_coroutine_threadsafe(application.bot.send_message(id, "✅🔀  Message consumed correctly by ESP32-CAM"), loop)
+
     elif msg.topic == "photo/response":
         logging.info("Message arrived on photos/response")
         for id in loc_chat_id_list:
-            mesg=msg.payload.decode('utf-8')
-            asyncio.run_coroutine_threadsafe(application.bot.send_message(id, f"💬  Response received from the server: \n\n {mesg}"), loop)
-     
-### MQTT setup
+            msg_json=json.loads(msg.payload.decode('utf-8'))
+
+            mesg= f"The analsys has recogised {msg_json['count']} objects: \n" 
+            for key in msg_json.keys():
+                if key.startswith("object"):
+                    mesg += f"- {msg_json[key]} \n"
+                elif key.startswith("description"):
+                    mesg += f"\n\nDescription: \n{msg_json[key]}"
+            asyncio.run_coroutine_threadsafe(application.bot.send_message(id, f"💬  Response received from the serve: \n\n{mesg}"), loop)
+
+    elif msg.topic == "photo/upload":
+        logging.info("Message arrived on photos/upload")
+
+        image_buffer = io.BytesIO(msg.payload)
+        
+        with Image.open(image_buffer) as img:
+            output_buffer = io.BytesIO() 
+            img.save(output_buffer, format="JPEG")
+            output_buffer.seek(0)
+
+            for id in loc_chat_id_list:
+                asyncio.run_coroutine_threadsafe(application.bot.send_photo(id, photo=InputFile(output_buffer, filename="photo.jpg")), loop)
+
+    elif msg.topic == "photo/nack":
+        logging.info("Message arrived on photos/nack")
+        for id in loc_chat_id_list:
+            asyncio.run_coroutine_threadsafe(application.bot.send_message(id, "❌🔀  Message not consumed correctly by ESP32-CAM"), loop)
+
+
+""" setupMQTT
+
+    This function has the purpose to setup the client: setting callbacks, reconnection delay
+    and connection to the MQTT Broker.
+    
+"""
+            
 def setupMQTT():
     global client
     client.on_message=on_message
+    client.on_connect = on_connect 
+    client.reconnect_delay_set(min_delay=1, max_delay=1200)
     client.connect("localhost", 1883, 60)  #host, port, keep-alive time
-    clientThread=mqtt.Client()
-    client.subscribe("photo/ack")
-    client.subscribe("photo/response")
-    client.loop_start()
 
-### Writing of chat ids        
+
+""" subscribingMQTT
+
+    This function calls the .subscribe method, 
+    in order to subscribe the client to topics. 
+"""
+def subscribingMQTT():
+    global client
+    client.subscribe("photo/ack")
+    client.subscribe("photo/nack")
+    client.subscribe("photo/response")
+    client.subscribe("photo/upload")
+
+
+
+""" write_ids
+
+    Naive method to take trace of the ids of the connected chats to the bot, in a single file.
+    This file is subsequently used to send messages to all chats connected to the bot.
+    (The bot is intended for personal use.)
+"""
 def write_ids(update):
     global loc_chat_id_list
     
@@ -65,7 +140,13 @@ def write_ids(update):
            file.write("\n")
 
             
-### Start handler
+""" start
+
+    This function allow the bot to react to "/start" command sent in the chat by the user
+    in order to activate it.
+    The response is composed by a "Keyboard Markup Reply", containing only a single button 
+    to send the command to shoot a photo.
+"""
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     write_ids(update)
@@ -81,7 +162,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("When you're ready, click the button below to shoot a photo.", reply_markup=reply_markup)
 
 
-### Handler for responses by the user
+""" handle_response
+
+    This function handles the behaviour of the buttons of the Keyboard Markup when pressed.
+    In this case, it handles the bhevaiour of the single "Shoot Photo" button and the fallback message
+    for the text messages sent by the user.
+"""
 async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_choice = update.message.text
@@ -101,27 +187,38 @@ async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info.wait_for_publish(0.1)
             if(info.is_published()):
                 logger.info("Message correctly published.")
-                await update.message.reply_text("✅ Message correctly published.")
-                time.sleep(1.5)
-                await update.message.reply_text("Waiting for response...")
+                await update.message.reply_text("✅ Message correctly published. \n\n ⏳ Waiting for response...")
+                await asyncio.sleep(1.5)
             else:
                 logger.error("Message not published.")
-                await update.message.reply_text("❌ Message not published due problems (waited but not published).")
+                await update.message.reply_text("❌ Message not published due problems (waited for too long).")
 
         except Exception:
             logger.error("Message not published.")
             await update.message.reply_text("❌ Message not published due some problems (probably the broker is down).")
 
             try:
-                setupMQTT()
+                client.reconnect()
             except ConnectionRefusedError:
                 logger.error("Broker not available.")
     else:
         await update.message.reply_text("Choose an option by the menu showed below. If it's not showing, press /start")
 
 
+
+""" main
+ 
+    In the main function, the application object is created, and initialized. Futhermore setupMQTT
+    is called to initialize the client, and the main event loop is started by client.loop_start. 
+    The loop global varibale is initialized with asyncio loop in order to send response messages. 
+    
+    After that, the main loop of the application is started calling application.run_polling()
+"""
 def main():
     global application, loop
+
+    application = ApplicationBuilder().token(os.getenv('TOKEN')).build()
+    
 
     ### Handlers for the bot
     start_handler = CommandHandler('start', start)
@@ -131,12 +228,22 @@ def main():
     response_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, handle_response)
     application.add_handler(response_handler)
 
-    ### Setup of MQTT and loop for asyncio 
-    setupMQTT()
-    loop = asyncio.get_event_loop()   
-    application.run_polling()
+    try:
+        ### Setup of MQTT and loop for asyncio 
+        setupMQTT()
+        client.loop_start()
+
     
-    client.loop_stop()
+        loop = asyncio.get_event_loop()
+         
+        application.run_polling()
+
+        
+    except KeyboardInterrupt as e:
+        logger.info("Exiting app")
+        client.loop_stop()
+
+    
 
 
 if __name__=="__main__":
