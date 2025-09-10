@@ -19,6 +19,11 @@ The system can receive images via MQTT topics, perform image recognition using L
 - **Python**: Primary development language (assumed based on common patterns)
 - **Paho MQTT**: Python MQTT client library
 
+## 🚧 Architecture
+
+![Architecture Scheme](./images/scheme.jpg)
+
+
 ## 🚀 Getting Started
 
 ### Prerequisites
